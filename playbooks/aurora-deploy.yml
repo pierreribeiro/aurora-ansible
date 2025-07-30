@@ -1,0 +1,33 @@
+---
+- name: Deploy Aurora Cluster
+  hosts: localhost
+  gather_facts: yes
+  vars_files:
+    - "{{ inventory_dir }}/group_vars/aurora.yml"
+  
+  tasks:
+    - name: Ensure AWS CLI is configured
+      command: aws sts get-caller-identity
+      register: aws_identity
+      changed_when: false
+      
+    - name: Display AWS account info
+      debug:
+        msg: "Deploying to AWS Account: {{ aws_identity.stdout | from_json | json_query('Account') }}"
+    
+    - name: Create Aurora cluster
+      include_role:
+        name: aurora-cluster
+      vars:
+        aurora_action: create
+    
+    - name: Configure monitoring
+      include_role:
+        name: aurora-monitoring
+      when: enable_monitoring | default(true)
+    
+    - name: Run post-deployment tests
+      include_role:
+        name: aurora-cluster
+        tasks_from: validate
+      tags: validate

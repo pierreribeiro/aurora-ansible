@@ -1,0 +1,4 @@
+---
+- name: Include action-specific tasks
+  include_tasks: "{{ aurora_action }}.yml"
+  when: aurora_action is defined

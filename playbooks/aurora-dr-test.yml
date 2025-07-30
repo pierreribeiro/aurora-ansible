@@ -1,0 +1,130 @@
+---
+- name: Aurora Disaster Recovery Test
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    dr_test_prefix: "dr-test-{{ ansible_date_time.epoch }}"
+    
+  tasks:
+    - name: Phase 1 - Backup current state
+      block:
+        - name: Create point-in-time snapshot
+          command: >
+            aws rds create-db-cluster-snapshot
+            --db-cluster-snapshot-identifier {{ dr_test_prefix }}-backup
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --tags Key=Purpose,Value=dr-test Key=TestID,Value={{ dr_test_prefix }}
+          register: backup_snapshot
+          
+        - name: Document current configuration
+          shell: |
+            aws rds describe-db-clusters \
+              --db-cluster-identifier {{ aurora_cluster_name }} \
+              > /tmp/{{ dr_test_prefix }}-config.json
+    
+    - name: Phase 2 - Simulate disaster
+      block:
+        - name: Create test database and table
+          mysql_db:
+            login_host: "{{ aurora_endpoint }}"
+            login_user: "{{ aurora_username }}"
+            login_password: "{{ aurora_password }}"
+            name: dr_test_db
+            state: present
+            
+        - name: Insert test data
+          mysql_query:
+            login_host: "{{ aurora_endpoint }}"
+            login_user: "{{ aurora_username }}"
+            login_password: "{{ aurora_password }}"
+            login_db: dr_test_db
+            query: |
+              CREATE TABLE dr_test (
+                id INT PRIMARY KEY,
+                data VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+              INSERT INTO dr_test (id, data) VALUES 
+              (1, 'Test data before disaster'),
+              (2, 'This should be recovered');
+              
+        - name: Record data checksum
+          mysql_query:
+            login_host: "{{ aurora_endpoint }}"
+            login_user: "{{ aurora_username }}"
+            login_password: "{{ aurora_password }}"
+            login_db: dr_test_db
+            query: "SELECT MD5(GROUP_CONCAT(CONCAT(id, data) ORDER BY id)) as checksum FROM dr_test"
+          register: original_checksum
+    
+    - name: Phase 3 - Restore from snapshot
+      block:
+        - name: Restore cluster from snapshot
+          command: >
+            aws rds restore-db-cluster-from-snapshot
+            --db-cluster-identifier {{ dr_test_prefix }}-restored
+            --snapshot-identifier {{ dr_test_prefix }}-backup
+            --engine {{ aurora_engine }}
+          register: restored_cluster
+          
+        - name: Create instance in restored cluster
+          command: >
+            aws rds create-db-instance
+            --db-instance-identifier {{ dr_test_prefix }}-restored-instance
+            --db-instance-class {{ aurora_writer_instance_class }}
+            --engine {{ aurora_engine }}
+            --db-cluster-identifier {{ dr_test_prefix }}-restored
+            
+        - name: Wait for restored cluster
+          command: >
+            aws rds wait db-instance-available
+            --db-instance-identifier {{ dr_test_prefix }}-restored-instance
+            
+        - name: Get restored cluster endpoint
+          command: >
+            aws rds describe-db-clusters
+            --db-cluster-identifier {{ dr_test_prefix }}-restored
+            --query 'DBClusters[0].Endpoint'
+            --output text
+          register: restored_endpoint
+          
+        - name: Verify data integrity
+          mysql_query:
+            login_host: "{{ restored_endpoint.stdout }}"
+            login_user: "{{ aurora_username }}"
+            login_password: "{{ aurora_password }}"
+            login_db: dr_test_db
+            query: "SELECT MD5(GROUP_CONCAT(CONCAT(id, data) ORDER BY id)) as checksum FROM dr_test"
+          register: restored_checksum
+          
+        - name: Compare checksums
+          assert:
+            that:
+              - original_checksum.query_result[0][0].checksum == restored_checksum.query_result[0][0].checksum
+            fail_msg: "Data integrity check failed!"
+            success_msg: "Data integrity verified successfully!"
+    
+    - name: Phase 4 - Cleanup
+      block:
+        - name: Delete test restored cluster
+          command: >
+            aws rds delete-db-cluster
+            --db-cluster-identifier {{ dr_test_prefix }}-restored
+            --skip-final-snapshot
+          when: cleanup_after_test | default(true)
+          
+        - name: Delete test snapshot
+          command: >
+            aws rds delete-db-cluster-snapshot
+            --db-cluster-snapshot-identifier {{ dr_test_prefix }}-backup
+          when: cleanup_after_test | default(true)
+      tags: cleanup
+    
+    - name: Generate DR test report
+      template:
+        src: dr-test-report.j2
+        dest: "/tmp/{{ dr_test_prefix }}-dr-test-report.html"
+      vars:
+        test_id: "{{ dr_test_prefix }}"
+        test_date: "{{ ansible_date_time.iso8601 }}"
+        test_result: "{{ 'PASSED' if restored_checksum is defined else 'FAILED' }}"

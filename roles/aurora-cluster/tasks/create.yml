@@ -1,0 +1,119 @@
+---
+- name: Check if cluster already exists
+  command: >
+    aws rds describe-db-clusters
+    --db-cluster-identifier {{ aurora_cluster_name }}
+    --region {{ aws_region }}
+  register: cluster_check
+  failed_when: false
+  changed_when: false
+
+- name: Create subnet group
+  command: >
+    aws rds create-db-subnet-group
+    --db-subnet-group-name {{ aurora_cluster_name }}-subnet-group
+    --db-subnet-group-description "Subnet group for {{ aurora_cluster_name }}"
+    --subnet-ids {{ aurora_subnet_ids | join(' ') }}
+    --region {{ aws_region }}
+  when: cluster_check.rc != 0
+  register: subnet_group
+
+- name: Create cluster parameter group
+  command: >
+    aws rds create-db-cluster-parameter-group
+    --db-cluster-parameter-group-name {{ aurora_cluster_name }}-cluster-params
+    --db-parameter-group-family {{ aurora_parameter_family }}
+    --description "Cluster parameters for {{ aurora_cluster_name }}"
+    --region {{ aws_region }}
+  when: cluster_check.rc != 0
+
+- name: Apply cluster parameters
+  command: >
+    aws rds modify-db-cluster-parameter-group
+    --db-cluster-parameter-group-name {{ aurora_cluster_name }}-cluster-params
+    --parameters {{ item }}
+    --region {{ aws_region }}
+  loop:
+    - "ParameterName=character_set_server,ParameterValue=utf8mb4,ApplyMethod=immediate"
+    - "ParameterName=collation_server,ParameterValue=utf8mb4_unicode_ci,ApplyMethod=immediate"
+    - "ParameterName=innodb_lock_wait_timeout,ParameterValue=50,ApplyMethod=immediate"
+  when: cluster_check.rc != 0
+
+- name: Generate master password
+  set_fact:
+    aurora_master_password: "{{ lookup('password', '/tmp/aurora-{{ aurora_cluster_name }}-password length=32 chars=ascii_letters,digits,!@#$%^&*()') }}"
+  when: cluster_check.rc != 0
+
+- name: Create Aurora cluster
+  command: >
+    aws rds create-db-cluster
+    --db-cluster-identifier {{ aurora_cluster_name }}
+    --engine {{ aurora_engine }}
+    --engine-version {{ aurora_engine_version }}
+    --database-name {{ aurora_database_name }}
+    --master-username {{ aurora_master_username }}
+    --master-user-password "{{ aurora_master_password }}"
+    --db-subnet-group-name {{ aurora_cluster_name }}-subnet-group
+    --vpc-security-group-ids {{ aurora_security_group_ids | join(' ') }}
+    --backup-retention-period {{ aurora_backup_retention }}
+    --preferred-backup-window {{ aurora_backup_window }}
+    --preferred-maintenance-window {{ aurora_maintenance_window }}
+    --storage-encrypted
+    --kms-key-id {{ aurora_kms_key_id }}
+    --enable-cloudwatch-logs-exports {{ aurora_log_exports | join(' ') }}
+    --deletion-protection
+    --region {{ aws_region }}
+  when: cluster_check.rc != 0
+  register: cluster_creation
+
+- name: Wait for cluster to be available
+  command: >
+    aws rds wait db-cluster-available
+    --db-cluster-identifier {{ aurora_cluster_name }}
+    --region {{ aws_region }}
+  when: cluster_creation is changed
+
+- name: Store master password in AWS Secrets Manager
+  command: >
+    aws secretsmanager create-secret
+    --name {{ aurora_cluster_name }}-master-password
+    --description "Master password for Aurora cluster {{ aurora_cluster_name }}"
+    --secret-string '{"username":"{{ aurora_master_username }}","password":"{{ aurora_master_password }}"}'
+    --region {{ aws_region }}
+  when: cluster_creation is changed
+
+- name: Create writer instance
+  command: >
+    aws rds create-db-instance
+    --db-instance-identifier {{ aurora_cluster_name }}-writer
+    --db-instance-class {{ aurora_writer_instance_class }}
+    --engine {{ aurora_engine }}
+    --db-cluster-identifier {{ aurora_cluster_name }}
+    --monitoring-interval 60
+    --monitoring-role-arn {{ aurora_monitoring_role_arn }}
+    --performance-insights-enabled
+    --region {{ aws_region }}
+  when: cluster_check.rc != 0
+
+- name: Create reader instances
+  command: >
+    aws rds create-db-instance
+    --db-instance-identifier {{ aurora_cluster_name }}-reader-{{ item }}
+    --db-instance-class {{ aurora_reader_instance_class }}
+    --engine {{ aurora_engine }}
+    --db-cluster-identifier {{ aurora_cluster_name }}
+    --promotion-tier {{ item }}
+    --region {{ aws_region }}
+  loop: "{{ range(1, aurora_reader_count + 1) | list }}"
+  when: cluster_check.rc != 0
+
+- name: Wait for all instances to be available
+  command: >
+    aws rds wait db-instance-available
+    --db-instance-identifier {{ item }}
+    --region {{ aws_region }}
+  loop:
+    - "{{ aurora_cluster_name }}-writer"
+    - "{{ aurora_cluster_name }}-reader-1"
+    - "{{ aurora_cluster_name }}-reader-2"
+  when: cluster_creation is changed

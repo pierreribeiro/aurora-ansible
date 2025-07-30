@@ -1,0 +1,125 @@
+---
+- name: Aurora Maintenance Tasks
+  hosts: localhost
+  gather_facts: yes
+  vars_prompt:
+    - name: maintenance_action
+      prompt: "Select maintenance action (backup/optimize/update/failover)"
+      private: no
+      
+  tasks:
+    - name: Execute backup tasks
+      block:
+        - name: Create manual snapshot
+          command: >
+            aws rds create-db-cluster-snapshot
+            --db-cluster-snapshot-identifier {{ aurora_cluster_name }}-manual-{{ ansible_date_time.epoch }}
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --tags Key=Type,Value=manual Key=CreatedBy,Value=ansible
+          register: snapshot
+          
+        - name: Wait for snapshot completion
+          command: >
+            aws rds wait db-cluster-snapshot-available
+            --db-cluster-snapshot-identifier {{ snapshot.stdout | from_json | json_query('DBClusterSnapshot.DBClusterSnapshotIdentifier') }}
+            
+        - name: Copy snapshot to DR region
+          command: >
+            aws rds copy-db-cluster-snapshot
+            --source-db-cluster-snapshot-identifier {{ snapshot.stdout | from_json | json_query('DBClusterSnapshot.DBClusterSnapshotArn') }}
+            --target-db-cluster-snapshot-identifier {{ aurora_cluster_name }}-dr-{{ ansible_date_time.epoch }}
+            --region {{ dr_region }}
+          when: enable_cross_region_backup | default(false)
+      when: maintenance_action == "backup"
+    
+    - name: Execute optimization tasks
+      block:
+        - name: Analyze slow queries
+          shell: |
+            mysql -h {{ aurora_endpoint }} -u {{ aurora_username }} -p{{ aurora_password }} << EOF
+            SELECT 
+              query_sample_text,
+              avg_timer_wait/1000000000000 as avg_time_sec,
+              sum_timer_wait/1000000000000 as total_time_sec,
+              count_star as executions
+            FROM performance_schema.events_statements_summary_by_digest
+            ORDER BY sum_timer_wait DESC
+            LIMIT 10;
+            EOF
+          register: slow_queries
+          
+        - name: Display slow queries
+          debug:
+            var: slow_queries.stdout_lines
+            
+        - name: Update table statistics
+          shell: |
+            mysql -h {{ aurora_endpoint }} -u {{ aurora_username }} -p{{ aurora_password }} {{ aurora_database }} << EOF
+            SELECT CONCAT('ANALYZE TABLE ', table_schema, '.', table_name, ';') 
+            FROM information_schema.tables 
+            WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+            AND table_type = 'BASE TABLE';
+            EOF
+          register: analyze_commands
+          
+        - name: Execute analyze commands
+          shell: |
+            mysql -h {{ aurora_endpoint }} -u {{ aurora_username }} -p{{ aurora_password }} {{ aurora_database }} << EOF
+            {{ analyze_commands.stdout }}
+            EOF
+      when: maintenance_action == "optimize"
+    
+    - name: Execute update tasks
+      block:
+        - name: Check for available engine updates
+          command: >
+            aws rds describe-db-engine-versions
+            --engine {{ aurora_engine }}
+            --engine-version {{ aurora_current_version }}
+            --query 'DBEngineVersions[0].ValidUpgradeTarget[*].[EngineVersion,Description]'
+            --output table
+          register: available_updates
+          
+        - name: Display available updates
+          debug:
+            var: available_updates.stdout_lines
+            
+        - name: Modify cluster for minor version upgrade
+          command: >
+            aws rds modify-db-cluster
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --engine-version {{ aurora_target_version }}
+            --apply-immediately
+          when: 
+            - aurora_target_version is defined
+            - confirm_update | default(false)
+      when: maintenance_action == "update"
+    
+    - name: Execute failover test
+      block:
+        - name: Get current writer instance
+          command: >
+            aws rds describe-db-clusters
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --query 'DBClusters[0].DBClusterMembers[?IsClusterWriter==`true`].DBInstanceIdentifier'
+            --output text
+          register: current_writer
+          
+        - name: Initiate failover
+          command: >
+            aws rds failover-db-cluster
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --target-db-instance-identifier {{ aurora_cluster_name }}-reader-1
+          when: confirm_failover | default(false)
+          
+        - name: Monitor failover progress
+          command: >
+            aws rds describe-db-clusters
+            --db-cluster-identifier {{ aurora_cluster_name }}
+            --query 'DBClusters[0].Status'
+          register: cluster_status
+          until: cluster_status.stdout | replace('"', '') == "available"
+          retries: 30
+          delay: 10
+          when: confirm_failover | default(false)
+      when: maintenance_action == "failover"
